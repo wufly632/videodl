@@ -6,8 +6,8 @@ Author:
 WeChat Official Account (微信公众号):
     Charles的皮卡丘
 '''
-import json
 import re
+import sqlite3
 from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -24,7 +24,8 @@ from .modules import VideoInfo
 from .__init__ import __version__
 
 
-DATA_FILE = Path(__file__).resolve().parents[1] / "videodl_api_data.json"
+DB_FILE = Path(__file__).resolve().parents[1] / "videodl_api.db"
+LEGACY_DATA_FILE = Path(__file__).resolve().parents[1] / "videodl_api_data.json"
 DATA_LOCK = Lock()
 MAX_HISTORY_ITEMS = 500
 
@@ -113,17 +114,91 @@ def _legacy_failure(
     return _legacy_success(data=data, retdesc=retdesc, succ=succ)
 
 
-def _load_data() -> dict[str, Any]:
-    if not DATA_FILE.exists():
+def _get_db_connection() -> sqlite3.Connection:
+    connection = sqlite3.connect(DB_FILE)
+    connection.row_factory = sqlite3.Row
+    return connection
+
+
+def _init_db() -> None:
+    with _get_db_connection() as connection:
+        connection.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS parse_history (
+                id TEXT PRIMARY KEY,
+                video_id TEXT,
+                title TEXT NOT NULL,
+                subtitle TEXT,
+                platform TEXT,
+                cover_url TEXT,
+                video_url TEXT,
+                source TEXT,
+                created_at INTEGER NOT NULL,
+                display_date TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS parse_stats (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                total_parse_count INTEGER NOT NULL DEFAULT 0
+            );
+
+            INSERT OR IGNORE INTO parse_stats (id, total_parse_count)
+            VALUES (1, 0);
+            """
+        )
+
+
+def _load_legacy_data() -> dict[str, Any]:
+    if not LEGACY_DATA_FILE.exists():
         return {"history": [], "total_parse_count": 0}
     try:
-        return json.loads(DATA_FILE.read_text(encoding="utf-8"))
+        import json
+        return json.loads(LEGACY_DATA_FILE.read_text(encoding="utf-8"))
     except Exception:
         return {"history": [], "total_parse_count": 0}
 
 
-def _save_data(data: dict[str, Any]) -> None:
-    DATA_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+def _migrate_legacy_json_if_needed() -> None:
+    if not LEGACY_DATA_FILE.exists():
+        return
+
+    with _get_db_connection() as connection:
+        current_count = connection.execute("SELECT COUNT(*) FROM parse_history").fetchone()[0]
+        if current_count > 0:
+            return
+
+        legacy = _load_legacy_data()
+        history = legacy.get("history", []) or []
+        total_count = int(legacy.get("total_parse_count", 0) or 0)
+        if not history and total_count <= 0:
+            return
+
+        for item in history:
+            connection.execute(
+                """
+                INSERT OR REPLACE INTO parse_history
+                (id, video_id, title, subtitle, platform, cover_url, video_url, source, created_at, display_date)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    item.get("id"),
+                    item.get("video_id"),
+                    item.get("title") or "未命名素材",
+                    item.get("subtitle"),
+                    item.get("platform"),
+                    item.get("cover_url"),
+                    item.get("video_url"),
+                    item.get("source"),
+                    int(item.get("created_at", 0) or 0),
+                    item.get("display_date") or _format_display_time(int(item.get("created_at", 0) or 0)),
+                ),
+            )
+
+        connection.execute(
+            "UPDATE parse_stats SET total_parse_count = ? WHERE id = 1",
+            (max(total_count, len(history)),),
+        )
+        connection.commit()
 
 
 def _now_ms() -> int:
@@ -154,13 +229,43 @@ def _build_record_from_video_info(video_info: VideoInfo) -> dict[str, Any]:
 
 
 def _append_history_record(video_info: VideoInfo) -> None:
+    record = _build_record_from_video_info(video_info)
     with DATA_LOCK:
-        data = _load_data()
-        history = data.get("history", [])
-        history.insert(0, _build_record_from_video_info(video_info))
-        data["history"] = history[:MAX_HISTORY_ITEMS]
-        data["total_parse_count"] = int(data.get("total_parse_count", 0)) + 1
-        _save_data(data)
+        with _get_db_connection() as connection:
+            connection.execute(
+                """
+                INSERT INTO parse_history
+                (id, video_id, title, subtitle, platform, cover_url, video_url, source, created_at, display_date)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    record["id"],
+                    record["video_id"],
+                    record["title"],
+                    record["subtitle"],
+                    record["platform"],
+                    record["cover_url"],
+                    record["video_url"],
+                    record["source"],
+                    record["created_at"],
+                    record["display_date"],
+                ),
+            )
+            connection.execute(
+                "UPDATE parse_stats SET total_parse_count = total_parse_count + 1 WHERE id = 1"
+            )
+            connection.execute(
+                """
+                DELETE FROM parse_history
+                WHERE id IN (
+                    SELECT id FROM parse_history
+                    ORDER BY created_at DESC
+                    LIMIT -1 OFFSET ?
+                )
+                """,
+                (MAX_HISTORY_ITEMS,),
+            )
+            connection.commit()
 
 
 def _match_period(timestamp_ms: int, period: str | None) -> bool:
@@ -221,6 +326,36 @@ def _normalize_history_item(item: dict[str, Any]) -> dict[str, Any]:
         "created_at": item.get("created_at"),
         "display_date": item.get("display_date") or _format_display_time(int(item.get("created_at", 0) or 0)),
     }
+
+
+def _get_total_parse_count() -> int:
+    with _get_db_connection() as connection:
+        row = connection.execute(
+            "SELECT total_parse_count FROM parse_stats WHERE id = 1"
+        ).fetchone()
+    return int(row["total_parse_count"] if row else 0)
+
+
+def _list_history_items(limit: int | None = None) -> list[dict[str, Any]]:
+    sql = """
+        SELECT id, video_id, title, subtitle, platform, cover_url, video_url, source, created_at, display_date
+        FROM parse_history
+        ORDER BY created_at DESC
+    """
+    params: tuple[Any, ...] = ()
+    if limit is not None:
+        sql += " LIMIT ?"
+        params = (limit,)
+    with _get_db_connection() as connection:
+        rows = connection.execute(sql, params).fetchall()
+    return [_normalize_history_item(dict(row)) for row in rows]
+
+
+def _clear_history_items() -> None:
+    with DATA_LOCK:
+        with _get_db_connection() as connection:
+            connection.execute("DELETE FROM parse_history")
+            connection.commit()
 
 
 def _build_ranking_items(history: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -335,6 +470,9 @@ app = FastAPI(
     description="HTTP wrapper around videodl.VideoClient for parsing and downloading videos.",
 )
 
+_init_db()
+_migrate_legacy_json_if_needed()
+
 
 @app.get("/")
 def index() -> dict[str, Any]:
@@ -434,14 +572,12 @@ def mp_refresh_video(request: MPRefreshRequest) -> dict[str, Any]:
 
 @app.get("/api/history")
 def mp_history(search: str = "", period: str = "all", limit: int = 100) -> dict[str, Any]:
-    with DATA_LOCK:
-        data = _load_data()
-    history = [_normalize_history_item(item) for item in data.get("history", [])]
+    history = _list_history_items()
     filtered = _filter_history_items(history, search=search, period=period)
     return _legacy_success(
         {
             "items": filtered[: max(0, limit)],
-            "total_count": int(data.get("total_parse_count", 0)),
+            "total_count": _get_total_parse_count(),
             "history_count": len(history),
         },
         retdesc="获取历史记录成功",
@@ -450,24 +586,19 @@ def mp_history(search: str = "", period: str = "all", limit: int = 100) -> dict[
 
 @app.post("/api/history/clear")
 def mp_clear_history() -> dict[str, Any]:
-    with DATA_LOCK:
-        data = _load_data()
-        data["history"] = []
-        _save_data(data)
+    _clear_history_items()
     return _legacy_success({"cleared": True}, retdesc="已清空历史记录")
 
 
 @app.get("/api/ranking")
 def mp_ranking(search: str = "", period: str = "7", limit: int = 50) -> dict[str, Any]:
-    with DATA_LOCK:
-        data = _load_data()
-    history = [_normalize_history_item(item) for item in data.get("history", [])]
+    history = _list_history_items()
     filtered = _filter_history_items(history, search=search, period=period)
     ranking = _build_ranking_items(filtered)
     return _legacy_success(
         {
             "items": ranking[: max(0, limit)],
-            "total_count": int(data.get("total_parse_count", 0)),
+            "total_count": _get_total_parse_count(),
         },
         retdesc="获取热门榜单成功",
     )
@@ -475,12 +606,10 @@ def mp_ranking(search: str = "", period: str = "7", limit: int = 50) -> dict[str
 
 @app.get("/api/stats")
 def mp_stats() -> dict[str, Any]:
-    with DATA_LOCK:
-        data = _load_data()
-    history = data.get("history", [])
+    history = _list_history_items()
     return _legacy_success(
         {
-            "total_count": int(data.get("total_parse_count", 0)),
+            "total_count": _get_total_parse_count(),
             "history_count": len(history),
         },
         retdesc="获取统计信息成功",
