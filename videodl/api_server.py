@@ -6,13 +6,19 @@ Author:
 WeChat Official Account (微信公众号):
     Charles的皮卡丘
 '''
+import json
+import mimetypes
+import os
 import re
 import sqlite3
+import tempfile
+import uuid
 from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 from threading import Lock
 from typing import Any
+from urllib.parse import quote, urlparse
 
 import click
 import uvicorn
@@ -20,7 +26,7 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
 from .videodl import VideoClient
-from .modules import VideoInfo
+from .modules import VideoInfo, legalizestring
 from .__init__ import __version__
 
 
@@ -28,6 +34,7 @@ DB_FILE = Path(__file__).resolve().parents[1] / "videodl_api.db"
 LEGACY_DATA_FILE = Path(__file__).resolve().parents[1] / "videodl_api_data.json"
 DATA_LOCK = Lock()
 MAX_HISTORY_ITEMS = 500
+DOWNLOAD_TMP_DIR = Path(tempfile.gettempdir()) / "videodl_mp_downloads"
 
 
 class ClientOptions(BaseModel):
@@ -59,6 +66,7 @@ class MPParseRequest(ClientOptions):
 class MPDownloadRequest(BaseModel):
     video_url: str | None = None
     video_id: str | None = None
+    user_key: str | None = None
 
 
 class MPRefreshRequest(ClientOptions):
@@ -126,6 +134,69 @@ def _get_db_connection() -> sqlite3.Connection:
     return connection
 
 
+def _storage_settings() -> dict[str, Any]:
+    return {
+        "bucket": os.getenv("OBJECT_STORAGE_BUCKET", "").strip(),
+        "region": os.getenv("OBJECT_STORAGE_REGION", "").strip() or None,
+        "endpoint_url": os.getenv("OBJECT_STORAGE_ENDPOINT_URL", "").strip() or None,
+        "access_key_id": os.getenv("OBJECT_STORAGE_ACCESS_KEY_ID", "").strip(),
+        "secret_access_key": os.getenv("OBJECT_STORAGE_SECRET_ACCESS_KEY", "").strip(),
+        "public_base_url": os.getenv("OBJECT_STORAGE_PUBLIC_BASE_URL", "").strip().rstrip("/"),
+        "prefix": os.getenv("OBJECT_STORAGE_PREFIX", "miniapp-downloads").strip().strip("/") or "miniapp-downloads",
+        "signed_url_expires": max(60, int(os.getenv("OBJECT_STORAGE_SIGNED_URL_EXPIRES", "604800"))),
+        "addressing_style": os.getenv("OBJECT_STORAGE_ADDRESSING_STYLE", "auto").strip() or "auto",
+    }
+
+
+def _storage_ready() -> bool:
+    settings = _storage_settings()
+    return bool(settings["bucket"] and settings["access_key_id"] and settings["secret_access_key"])
+
+
+def _create_s3_client():
+    settings = _storage_settings()
+    from boto3.session import Session
+    from botocore.config import Config
+
+    session = Session(
+        aws_access_key_id=settings["access_key_id"],
+        aws_secret_access_key=settings["secret_access_key"],
+        region_name=settings["region"],
+    )
+    return session.client(
+        "s3",
+        endpoint_url=settings["endpoint_url"],
+        config=Config(signature_version="s3v4", s3={"addressing_style": settings["addressing_style"]}),
+    )
+
+
+def _guess_ext_from_url(url: str) -> str:
+    path = urlparse(url or "").path
+    ext = Path(path).suffix.lstrip(".").lower()
+    return ext or "mp4"
+
+
+def _safe_video_stem(value: str | None) -> str:
+    safe = legalizestring((value or "").strip()) if value else ""
+    safe = re.sub(r"\s+", "-", safe).strip("._-")
+    return (safe[:80] or "video")
+
+
+def _ensure_history_columns(connection: sqlite3.Connection) -> None:
+    columns = {row["name"] for row in connection.execute("PRAGMA table_info(parse_history)").fetchall()}
+    required_columns = {
+        "user_key": "TEXT",
+        "share_url": "TEXT",
+        "video_info_json": "TEXT",
+        "object_url": "TEXT",
+        "object_key": "TEXT",
+        "mirrored_at": "INTEGER",
+    }
+    for column_name, column_type in required_columns.items():
+        if column_name not in columns:
+            connection.execute(f"ALTER TABLE parse_history ADD COLUMN {column_name} {column_type}")
+
+
 def _init_db() -> None:
     with _get_db_connection() as connection:
         connection.executescript(
@@ -139,6 +210,11 @@ def _init_db() -> None:
                 platform TEXT,
                 cover_url TEXT,
                 video_url TEXT,
+                share_url TEXT,
+                video_info_json TEXT,
+                object_url TEXT,
+                object_key TEXT,
+                mirrored_at INTEGER,
                 source TEXT,
                 created_at INTEGER NOT NULL,
                 display_date TEXT NOT NULL
@@ -158,11 +234,12 @@ def _init_db() -> None:
             VALUES (1, 0);
             """
         )
-        columns = {row["name"] for row in connection.execute("PRAGMA table_info(parse_history)").fetchall()}
-        if "user_key" not in columns:
-            connection.execute("ALTER TABLE parse_history ADD COLUMN user_key TEXT")
+        _ensure_history_columns(connection)
         connection.execute(
             "CREATE INDEX IF NOT EXISTS idx_parse_history_user_key_created_at ON parse_history(user_key, created_at DESC)"
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_parse_history_video_id_created_at ON parse_history(video_id, created_at DESC)"
         )
 
 
@@ -170,7 +247,6 @@ def _load_legacy_data() -> dict[str, Any]:
     if not LEGACY_DATA_FILE.exists():
         return {"history": [], "total_parse_count": 0}
     try:
-        import json
         return json.loads(LEGACY_DATA_FILE.read_text(encoding="utf-8"))
     except Exception:
         return {"history": [], "total_parse_count": 0}
@@ -195,8 +271,8 @@ def _migrate_legacy_json_if_needed() -> None:
             connection.execute(
                 """
                 INSERT OR REPLACE INTO parse_history
-                (id, user_key, video_id, title, subtitle, platform, cover_url, video_url, source, created_at, display_date)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                (id, user_key, video_id, title, subtitle, platform, cover_url, video_url, share_url, video_info_json, object_url, object_key, mirrored_at, source, created_at, display_date)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     item.get("id"),
@@ -207,6 +283,11 @@ def _migrate_legacy_json_if_needed() -> None:
                     item.get("platform"),
                     item.get("cover_url"),
                     item.get("video_url"),
+                    item.get("share_url"),
+                    item.get("video_info_json"),
+                    item.get("object_url"),
+                    item.get("object_key"),
+                    item.get("mirrored_at"),
                     item.get("source"),
                     int(item.get("created_at", 0) or 0),
                     item.get("display_date") or _format_display_time(int(item.get("created_at", 0) or 0)),
@@ -229,7 +310,27 @@ def _format_display_time(timestamp_ms: int) -> str:
     return dt.strftime("%Y-%m-%d %H:%M")
 
 
-def _build_record_from_video_info(video_info: VideoInfo, user_key: str | None = None) -> dict[str, Any]:
+def _json_dumps(value: Any) -> str:
+    return json.dumps(_json_safe(value), ensure_ascii=False)
+
+
+def _json_loads_dict(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    if not value:
+        return {}
+    try:
+        data = json.loads(str(value))
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _build_record_from_video_info(
+    video_info: VideoInfo,
+    user_key: str | None = None,
+    share_url: str | None = None,
+) -> dict[str, Any]:
     created_at = _now_ms()
     video_id = video_info.identifier or video_info.title or str(created_at)
     platform = _format_platform_name(video_info.source) or "未知来源"
@@ -242,21 +343,30 @@ def _build_record_from_video_info(video_info: VideoInfo, user_key: str | None = 
         "platform": platform,
         "cover_url": video_info.cover_url or "",
         "video_url": video_info.download_url or "",
+        "share_url": (share_url or "").strip() or None,
+        "video_info_json": _json_dumps(_serialize_video_info(video_info)),
+        "object_url": None,
+        "object_key": None,
+        "mirrored_at": None,
         "source": video_info.source or platform,
         "created_at": created_at,
         "display_date": _format_display_time(created_at),
     }
 
 
-def _append_history_record(video_info: VideoInfo, user_key: str | None = None) -> None:
-    record = _build_record_from_video_info(video_info, user_key=user_key)
+def _append_history_record(
+    video_info: VideoInfo,
+    user_key: str | None = None,
+    share_url: str | None = None,
+) -> dict[str, Any]:
+    record = _build_record_from_video_info(video_info, user_key=user_key, share_url=share_url)
     with DATA_LOCK:
         with _get_db_connection() as connection:
             connection.execute(
                 """
                 INSERT INTO parse_history
-                (id, user_key, video_id, title, subtitle, platform, cover_url, video_url, source, created_at, display_date)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                (id, user_key, video_id, title, subtitle, platform, cover_url, video_url, share_url, video_info_json, object_url, object_key, mirrored_at, source, created_at, display_date)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     record["id"],
@@ -267,6 +377,11 @@ def _append_history_record(video_info: VideoInfo, user_key: str | None = None) -
                     record["platform"],
                     record["cover_url"],
                     record["video_url"],
+                    record["share_url"],
+                    record["video_info_json"],
+                    record["object_url"],
+                    record["object_key"],
+                    record["mirrored_at"],
                     record["source"],
                     record["created_at"],
                     record["display_date"],
@@ -296,6 +411,7 @@ def _append_history_record(video_info: VideoInfo, user_key: str | None = None) -
                 (MAX_HISTORY_ITEMS,),
             )
             connection.commit()
+    return record
 
 
 def _match_period(timestamp_ms: int, period: str | None) -> bool:
@@ -353,6 +469,11 @@ def _normalize_history_item(item: dict[str, Any]) -> dict[str, Any]:
         "platform": item.get("platform"),
         "cover_url": item.get("cover_url"),
         "video_url": item.get("video_url"),
+        "share_url": item.get("share_url"),
+        "video_info_json": item.get("video_info_json"),
+        "object_url": item.get("object_url"),
+        "object_key": item.get("object_key"),
+        "mirrored_at": item.get("mirrored_at"),
         "source": item.get("source"),
         "created_at": item.get("created_at"),
         "display_date": item.get("display_date") or _format_display_time(int(item.get("created_at", 0) or 0)),
@@ -376,7 +497,7 @@ def _get_total_parse_count(user_key: str | None = None) -> int:
 
 def _list_history_items(limit: int | None = None, user_key: str | None = None) -> list[dict[str, Any]]:
     sql = """
-        SELECT id, user_key, video_id, title, subtitle, platform, cover_url, video_url, source, created_at, display_date
+        SELECT id, user_key, video_id, title, subtitle, platform, cover_url, video_url, share_url, video_info_json, object_url, object_key, mirrored_at, source, created_at, display_date
         FROM parse_history
     """
     params: list[Any] = []
@@ -401,6 +522,135 @@ def _clear_history_items(user_key: str | None = None) -> None:
                 connection.execute("DELETE FROM parse_history WHERE user_key = ?", (normalized_user_key,))
             else:
                 connection.execute("DELETE FROM parse_history")
+            connection.commit()
+
+
+def _find_history_record(video_identifier: str | None = None, video_url: str | None = None, user_key: str | None = None) -> dict[str, Any] | None:
+    normalized_identifier = (video_identifier or "").strip()
+    normalized_video_url = (video_url or "").strip()
+    normalized_user_key = (user_key or "").strip()
+    clauses: list[str] = []
+    params: list[Any] = []
+
+    if normalized_identifier:
+        clauses.append("(id = ? OR video_id = ?)")
+        params.extend([normalized_identifier, normalized_identifier])
+    if normalized_video_url:
+        clauses.append("video_url = ?")
+        params.append(normalized_video_url)
+    if not clauses:
+        return None
+
+    sql = """
+        SELECT id, user_key, video_id, title, subtitle, platform, cover_url, video_url, share_url, video_info_json, object_url, object_key, mirrored_at, source, created_at, display_date
+        FROM parse_history
+        WHERE ({conditions})
+    """.format(conditions=" OR ".join(clauses))
+    if normalized_user_key:
+        sql += " AND user_key = ?"
+        params.append(normalized_user_key)
+    sql += " ORDER BY created_at DESC LIMIT 1"
+
+    with _get_db_connection() as connection:
+        row = connection.execute(sql, tuple(params)).fetchone()
+    return _normalize_history_item(dict(row)) if row else None
+
+
+def _build_temp_video_info(record: dict[str, Any]) -> VideoInfo:
+    stored_video_info = _json_loads_dict(record.get("video_info_json"))
+    if stored_video_info:
+        video_info = VideoInfo.fromdict(stored_video_info)
+    else:
+        fallback_url = str(record.get("video_url") or "").strip()
+        if not fallback_url:
+            raise RuntimeError("未找到可用的视频下载地址")
+        video_info = VideoInfo(
+            source=record.get("source"),
+            title=record.get("title") or "",
+            cover_url=record.get("cover_url") or "",
+            identifier=record.get("video_id") or record.get("id") or "",
+            download_url=fallback_url,
+            ext=_guess_ext_from_url(fallback_url),
+        )
+
+    ext = (video_info.ext or "").strip().lower() or _guess_ext_from_url(str(video_info.download_url or ""))
+    file_stem = _safe_video_stem(video_info.title or video_info.identifier or record.get("id"))
+    file_suffix = f".{ext or 'mp4'}"
+    DOWNLOAD_TMP_DIR.mkdir(parents=True, exist_ok=True)
+    video_info.ext = ext or "mp4"
+    video_info.save_path = str(DOWNLOAD_TMP_DIR / f"{file_stem}-{uuid.uuid4().hex[:12]}{file_suffix}")
+
+    if video_info.with_valid_audio_download_url:
+        audio_ext = (video_info.audio_ext or "m4a").strip().lower() or "m4a"
+        video_info.audio_save_path = str(DOWNLOAD_TMP_DIR / f"{file_stem}-{uuid.uuid4().hex[:12]}-audio.{audio_ext}")
+    else:
+        video_info.audio_save_path = ""
+
+    return video_info
+
+
+def _mirror_video_to_object_storage(record: dict[str, Any]) -> tuple[str, str]:
+    if not _storage_ready():
+        raise RuntimeError("对象存储未配置，请先配置 OBJECT_STORAGE_* 环境变量")
+
+    video_info = _build_temp_video_info(record)
+    client = _build_client(ClientOptions())
+    downloaded_video_infos = client.download(video_infos=[video_info])
+    if not downloaded_video_infos:
+        raise RuntimeError("服务端下载视频失败")
+
+    downloaded_video_info = downloaded_video_infos[0]
+    local_path = Path(downloaded_video_info.save_path or video_info.save_path)
+    if not local_path.exists():
+        raise RuntimeError("服务端未生成可上传的视频文件")
+
+    settings = _storage_settings()
+    object_key = "/".join([
+        settings["prefix"],
+        datetime.now(tz=timezone.utc).strftime("%Y/%m/%d"),
+        f"{_safe_video_stem(downloaded_video_info.title or downloaded_video_info.identifier or record.get('video_id'))}-{uuid.uuid4().hex[:12]}{local_path.suffix or '.mp4'}",
+    ])
+    content_type = mimetypes.guess_type(local_path.name)[0] or "application/octet-stream"
+    s3_client = _create_s3_client()
+
+    try:
+        s3_client.upload_file(
+            str(local_path),
+            settings["bucket"],
+            object_key,
+            ExtraArgs={"ContentType": content_type},
+        )
+    finally:
+        local_path.exists() and local_path.unlink()
+        audio_save_path = (downloaded_video_info.audio_save_path or video_info.audio_save_path or "").strip()
+        audio_path = Path(audio_save_path) if audio_save_path else None
+        if audio_path and audio_path.exists():
+            audio_path.unlink()
+
+    if settings["public_base_url"]:
+        object_url = f"{settings['public_base_url']}/{quote(object_key, safe='/')}"
+    else:
+        object_url = s3_client.generate_presigned_url(
+            "get_object",
+            Params={"Bucket": settings["bucket"], "Key": object_key},
+            ExpiresIn=settings["signed_url_expires"],
+        )
+
+    return object_url, object_key
+
+
+def _persist_mirrored_object(record_id: str, object_url: str, object_key: str) -> None:
+    mirrored_at = _now_ms()
+    with DATA_LOCK:
+        with _get_db_connection() as connection:
+            connection.execute(
+                """
+                UPDATE parse_history
+                SET object_url = ?, object_key = ?, mirrored_at = ?, video_url = ?
+                WHERE id = ?
+                """,
+                (object_url, object_key, mirrored_at, object_url, record_id),
+            )
             connection.commit()
 
 
@@ -444,6 +694,7 @@ def _build_ranking_items(history: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 def _null_mp_video_data() -> dict[str, Any]:
     return {
+        "history_id": None,
         "video_url": None,
         "title": None,
         "cover_url": None,
@@ -484,6 +735,7 @@ def _to_mp_video_data(video_info: VideoInfo | None) -> dict[str, Any]:
     if video_info is None:
         return _null_mp_video_data()
     return {
+        "history_id": None,
         "video_url": video_info.download_url or None,
         "title": video_info.title or None,
         "cover_url": video_info.cover_url or None,
@@ -504,8 +756,10 @@ def _parse_to_mp_result(request: MPParseRequest | MPRefreshRequest) -> dict[str,
         video_info = _pick_video_info(video_infos)
         if video_info is None or not video_info.with_valid_download_url:
             return _legacy_failure("未解析到可用视频信息", _to_mp_video_data(video_info))
-        _append_history_record(video_info, user_key=request.user_key)
-        return _legacy_success(_to_mp_video_data(video_info), retdesc="解析成功")
+        record = _append_history_record(video_info, user_key=request.user_key, share_url=url)
+        response_data = _to_mp_video_data(video_info)
+        response_data["history_id"] = record["id"]
+        return _legacy_success(response_data, retdesc="解析成功")
     except Exception as exc:
         return _legacy_failure(f"解析失败: {exc}", _null_mp_video_data())
 
@@ -599,16 +853,40 @@ def mp_parse_video(request: MPParseRequest) -> dict[str, Any]:
 
 @app.post("/api/download")
 def mp_download_video(request: MPDownloadRequest) -> dict[str, Any]:
-    video_url = (request.video_url or "").strip()
-    if not video_url:
-        return _legacy_failure("缺少 video_url", {"download_url": None})
-    return _legacy_success(
-        {
-            "download_url": video_url,
-            "video_id": request.video_id or None,
-        },
-        retdesc="获取下载地址成功",
+    if not _storage_ready():
+        return _legacy_failure("对象存储未配置，请先配置 OBJECT_STORAGE_* 环境变量", {"download_url": None})
+
+    record = _find_history_record(
+        video_identifier=request.video_id,
+        video_url=request.video_url,
+        user_key=request.user_key,
     )
+    if record is None:
+        return _legacy_failure("未找到可下载的视频记录，请重新解析后再试", {"download_url": None})
+
+    if record.get("object_url"):
+        return _legacy_success(
+            {
+                "download_url": record["object_url"],
+                "video_id": record.get("video_id") or request.video_id or None,
+                "history_id": record["id"],
+            },
+            retdesc="获取下载地址成功",
+        )
+
+    try:
+        object_url, object_key = _mirror_video_to_object_storage(record)
+        _persist_mirrored_object(record["id"], object_url, object_key)
+        return _legacy_success(
+            {
+                "download_url": object_url,
+                "video_id": record.get("video_id") or request.video_id or None,
+                "history_id": record["id"],
+            },
+            retdesc="获取下载地址成功",
+        )
+    except Exception as exc:
+        return _legacy_failure(f"生成下载地址失败: {exc}", {"download_url": None})
 
 
 @app.post("/api/refresh_video")
