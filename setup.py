@@ -36,11 +36,12 @@ setup(
     license=videodl.__license__,
     license_files=("LICENSE",),
     include_package_data=True,
+    py_modules=['json_repair'],
     packages=find_packages(),
     package_data={"videodl": [
         "modules/cdm/*.wvd", "modules/js/youtube/*.js", "modules/js/xmflv/*.js", "modules/js/xmflv/xiami_token.wasm", "modules/js/tencent/*.js", "modules/js/tencent/ckey.wasm", "modules/js/cctv/*.js",
     ]},
-    entry_points={'console_scripts': ['videodl = videodl.videodl:VideoClientCMD']},
+    entry_points={'console_scripts': ['videodl = videodl.videodl:VideoClientCMD', 'videodl-api = videodl.api_server:VideoClientAPICMD']},
     install_requires=[lab.strip('\n') for lab in list(open('requirements.txt', 'r').readlines()) if lab.strip('\n')],
     zip_safe=True,
 )

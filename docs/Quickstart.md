@@ -250,6 +250,66 @@ video_infos = video_client.parsefromurl("URL")
 video_client.download(video_infos)
 ```
 
+#### Quick Use Videodl as HTTP API
+
+(1) Install the extra web dependencies
+
+```bash
+pip install -r requirements.txt
+```
+
+(2) Start the API server
+
+```bash
+videodl-api --host 0.0.0.0 --port 8000
+```
+
+After startup, you can open:
+
+- `http://127.0.0.1:8000/docs` for Swagger UI
+- `http://127.0.0.1:8000/health` for health check
+
+(3) Parse a video URL
+
+```bash
+curl -X POST "http://127.0.0.1:8000/parse" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "url": "https://www.acfun.cn/v/ac36491489",
+    "allowed_video_sources": ["AcFunVideoClient"]
+  }'
+```
+
+(4) Download already parsed video infos
+
+```bash
+curl -X POST "http://127.0.0.1:8000/download" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "video_infos": [
+      {
+        "source": "AcFunVideoClient",
+        "download_url": "https://example.com/demo.mp4",
+        "title": "demo",
+        "save_path": "videodl_outputs/AcFunVideoClient/demo.mp4",
+        "ext": "mp4",
+        "identifier": "demo"
+      }
+    ]
+  }'
+```
+
+(5) Parse and download in one request
+
+```bash
+curl -X POST "http://127.0.0.1:8000/parse-and-download" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "url": "https://www.acfun.cn/v/ac36491489",
+    "allowed_video_sources": ["AcFunVideoClient"]
+  }'
+```
+
 #### Parse First, Then Inspect the Result
 
 Sometimes it is useful to inspect the parsed result before downloading.

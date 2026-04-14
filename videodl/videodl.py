@@ -9,7 +9,11 @@ WeChat Official Account (微信公众号):
 import sys
 import copy
 import click
-import json_repair
+import json
+try:
+    import json_repair
+except ImportError:
+    json_repair = None
 if __name__ == '__main__':
     from __init__ import __version__
     from modules import BuildVideoClient, BuildCommonVideoClient, LoggerHandle, VideoClientBuilder, CommonVideoClientBuilder, WebMediaGrabber, BaseVideoClient, VideoInfo, printfullline
@@ -129,6 +133,7 @@ class VideoClient():
                 if isinstance(self.common_video_clients[source], dict): self.common_video_clients[source] = BuildCommonVideoClient(module_cfg=self.common_video_clients[source]['cfg'])
                 common_video_client: BaseVideoClient | dict[str, BaseVideoClient] = self.common_video_clients[source]
                 downloaded_video_infos.extend(common_video_client.download(video_infos=source_video_infos, num_threadings=self.clients_threadings.get(source, 5), request_overrides=self.requests_overrides.get(source, {})))
+        return downloaded_video_infos
     '''processinputs'''
     def processinputs(self, input_tip='', prefix: str = '\n', restart_ui: str = 'startparseurlcmdui'):
         # accept user inputs
@@ -155,7 +160,7 @@ class VideoClient():
 @click.option('-g', '--apply-common-video-clients-only', '--apply_common_video_clients_only', is_flag=True, default=False, help='Only apply common video clients.', show_default=True)
 def VideoClientCMD(index_url: str, allowed_video_sources: str, init_video_clients_cfg: str, requests_overrides: str, clients_threadings: str, apply_common_video_clients_only: bool):
     # load settings
-    safe_load_func = lambda s: (json_repair.loads(s) or {}) if s else {}
+    safe_load_func = lambda s: ((json_repair.loads(s) if json_repair else json.loads(s)) or {}) if s else {}
     allowed_video_sources = [s.strip() for s in allowed_video_sources.strip().split(',')] if allowed_video_sources else []
     init_video_clients_cfg = safe_load_func(init_video_clients_cfg); requests_overrides = safe_load_func(requests_overrides); clients_threadings = safe_load_func(clients_threadings)
     # instance video client
