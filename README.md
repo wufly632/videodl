@@ -262,6 +262,163 @@ Specifically, these CLI tools include,
   To enable aria2c during video downloading, please refer to the [Quick Start](https://github.com/CharlesPikachu/videodl?tab=readme-ov-file#-quick-start) section.
 
 
+# 🚢 Mini App Backend Deployment
+
+This section describes the production deployment flow for the mini app backend based on `videodl.api_server`.
+
+#### 1. Server Requirements
+
+- Linux server with Python `3.11+`
+- `ffmpeg` available on `PATH`
+- Public HTTPS domain for the API
+- Object storage bucket for mirrored downloads
+- Outbound network access to the target video platforms
+
+#### 2. Clone and Install
+
+```bash
+cd /opt
+git clone git@github.com:wufly632/videodl.git
+cd videodl
+python3.11 -m venv .venv
+source .venv/bin/activate
+pip install -U pip setuptools wheel
+pip install -r requirements.txt
+pip install -e .
+```
+
+To verify the environment:
+
+```bash
+python -V
+ffmpeg -version
+python -m videodl.api_server --host 127.0.0.1 --port 19050
+```
+
+#### 3. Configure Object Storage
+
+The mini app download flow does not return third-party video URLs directly.  
+Instead, the backend downloads the video on the server, uploads it to your own object storage, and then returns your own download URL to the mini app.
+
+The backend currently uses an S3-compatible client, so you must configure these environment variables:
+
+```bash
+OBJECT_STORAGE_BUCKET=your-bucket
+OBJECT_STORAGE_REGION=your-region
+OBJECT_STORAGE_ENDPOINT_URL=https://your-s3-compatible-endpoint
+OBJECT_STORAGE_ACCESS_KEY_ID=your-access-key
+OBJECT_STORAGE_SECRET_ACCESS_KEY=your-secret-key
+OBJECT_STORAGE_PUBLIC_BASE_URL=https://your-public-download-domain
+OBJECT_STORAGE_PREFIX=miniapp-downloads
+```
+
+Notes:
+
+- `OBJECT_STORAGE_PUBLIC_BASE_URL` must be the real public bucket/CDN domain, not just the vendor region endpoint.
+- If you use a CDN or custom domain, put that domain into `OBJECT_STORAGE_PUBLIC_BASE_URL`.
+- The mini app must add this download domain to `downloadFile` legal domains in the WeChat Mini Program console.
+- The API domain must be added separately to `request` legal domains.
+
+#### 4. systemd Service
+
+Create `/etc/systemd/system/videodl.service`:
+
+```ini
+[Unit]
+Description=videodl API service
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/videodl
+Environment=PATH=/opt/videodl/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin
+Environment=OBJECT_STORAGE_BUCKET=your-bucket
+Environment=OBJECT_STORAGE_REGION=your-region
+Environment=OBJECT_STORAGE_ENDPOINT_URL=https://your-s3-compatible-endpoint
+Environment=OBJECT_STORAGE_ACCESS_KEY_ID=your-access-key
+Environment=OBJECT_STORAGE_SECRET_ACCESS_KEY=your-secret-key
+Environment=OBJECT_STORAGE_PUBLIC_BASE_URL=https://your-public-download-domain
+Environment=OBJECT_STORAGE_PREFIX=miniapp-downloads
+ExecStart=/opt/videodl/.venv/bin/python -m videodl.api_server --host 127.0.0.1 --port 19050
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Enable and start it:
+
+```bash
+systemctl daemon-reload
+systemctl enable videodl
+systemctl start videodl
+systemctl status videodl
+```
+
+View logs:
+
+```bash
+journalctl -u videodl -f
+```
+
+#### 5. Reverse Proxy
+
+Expose the local API with `nginx`:
+
+```nginx
+server {
+    listen 80;
+    server_name api.example.com;
+
+    location / {
+        proxy_pass http://127.0.0.1:19050;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+}
+```
+
+After that, enable HTTPS using your preferred certificate solution such as `certbot`.
+
+#### 6. Health Check
+
+```bash
+curl http://127.0.0.1:19050/health
+curl http://127.0.0.1:19050/docs
+```
+
+Expected `/health` response:
+
+```json
+{"ok": true, "version": "0.8.3"}
+```
+
+#### 7. Deployment Updates
+
+When updating production:
+
+```bash
+cd /opt/videodl
+git pull origin master
+source .venv/bin/activate
+pip install -r requirements.txt
+pip install -e .
+systemctl restart videodl
+```
+
+#### 8. Troubleshooting
+
+- If `/api/download` returns HTTP `200` but the mini app still fails, inspect the JSON body instead of only the HTTP code.
+- If videos are downloaded into `/tmp/videodl_mp_downloads` but not uploaded to object storage, the failure is usually in object storage configuration or SDK compatibility.
+- If the backend can return a valid object URL but the mini app still cannot save the file, re-check the WeChat `downloadFile` legal domains.
+- If some platforms return `m3u8` streams, ensure `ffmpeg` is installed and callable by the service user.
+
+
 # ⚡ Quick Start
 
 This guide shows the fastest ways to use videodl from the command line and from Python.
