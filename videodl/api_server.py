@@ -53,6 +53,7 @@ class ParseAndDownloadRequest(ParseRequest):
 class MPParseRequest(ClientOptions):
     text: str | None = None
     url: str | None = None
+    user_key: str | None = None
 
 
 class MPDownloadRequest(BaseModel):
@@ -66,6 +67,11 @@ class MPRefreshRequest(ClientOptions):
     video_url: str | None = None
     video_id: str | None = None
     platform: str | None = None
+    user_key: str | None = None
+
+
+class MPHistoryClearRequest(BaseModel):
+    user_key: str | None = None
 
 
 def _build_client(options: ClientOptions) -> VideoClient:
@@ -126,6 +132,7 @@ def _init_db() -> None:
             """
             CREATE TABLE IF NOT EXISTS parse_history (
                 id TEXT PRIMARY KEY,
+                user_key TEXT,
                 video_id TEXT,
                 title TEXT NOT NULL,
                 subtitle TEXT,
@@ -142,9 +149,20 @@ def _init_db() -> None:
                 total_parse_count INTEGER NOT NULL DEFAULT 0
             );
 
+            CREATE TABLE IF NOT EXISTS parse_user_stats (
+                user_key TEXT PRIMARY KEY,
+                total_parse_count INTEGER NOT NULL DEFAULT 0
+            );
+
             INSERT OR IGNORE INTO parse_stats (id, total_parse_count)
             VALUES (1, 0);
             """
+        )
+        columns = {row["name"] for row in connection.execute("PRAGMA table_info(parse_history)").fetchall()}
+        if "user_key" not in columns:
+            connection.execute("ALTER TABLE parse_history ADD COLUMN user_key TEXT")
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_parse_history_user_key_created_at ON parse_history(user_key, created_at DESC)"
         )
 
 
@@ -177,11 +195,12 @@ def _migrate_legacy_json_if_needed() -> None:
             connection.execute(
                 """
                 INSERT OR REPLACE INTO parse_history
-                (id, video_id, title, subtitle, platform, cover_url, video_url, source, created_at, display_date)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                (id, user_key, video_id, title, subtitle, platform, cover_url, video_url, source, created_at, display_date)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     item.get("id"),
+                    item.get("user_key"),
                     item.get("video_id"),
                     item.get("title") or "未命名素材",
                     item.get("subtitle"),
@@ -210,12 +229,13 @@ def _format_display_time(timestamp_ms: int) -> str:
     return dt.strftime("%Y-%m-%d %H:%M")
 
 
-def _build_record_from_video_info(video_info: VideoInfo) -> dict[str, Any]:
+def _build_record_from_video_info(video_info: VideoInfo, user_key: str | None = None) -> dict[str, Any]:
     created_at = _now_ms()
     video_id = video_info.identifier or video_info.title or str(created_at)
     platform = _format_platform_name(video_info.source) or "未知来源"
     return {
         "id": f"{video_id}:{created_at}",
+        "user_key": (user_key or "").strip() or None,
         "video_id": str(video_id),
         "title": video_info.title or "未命名素材",
         "subtitle": f"来自 {platform} 的真实解析记录",
@@ -228,18 +248,19 @@ def _build_record_from_video_info(video_info: VideoInfo) -> dict[str, Any]:
     }
 
 
-def _append_history_record(video_info: VideoInfo) -> None:
-    record = _build_record_from_video_info(video_info)
+def _append_history_record(video_info: VideoInfo, user_key: str | None = None) -> None:
+    record = _build_record_from_video_info(video_info, user_key=user_key)
     with DATA_LOCK:
         with _get_db_connection() as connection:
             connection.execute(
                 """
                 INSERT INTO parse_history
-                (id, video_id, title, subtitle, platform, cover_url, video_url, source, created_at, display_date)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                (id, user_key, video_id, title, subtitle, platform, cover_url, video_url, source, created_at, display_date)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     record["id"],
+                    record["user_key"],
                     record["video_id"],
                     record["title"],
                     record["subtitle"],
@@ -254,6 +275,15 @@ def _append_history_record(video_info: VideoInfo) -> None:
             connection.execute(
                 "UPDATE parse_stats SET total_parse_count = total_parse_count + 1 WHERE id = 1"
             )
+            if record["user_key"]:
+                connection.execute(
+                    """
+                    INSERT INTO parse_user_stats (user_key, total_parse_count)
+                    VALUES (?, 1)
+                    ON CONFLICT(user_key) DO UPDATE SET total_parse_count = total_parse_count + 1
+                    """,
+                    (record["user_key"],),
+                )
             connection.execute(
                 """
                 DELETE FROM parse_history
@@ -316,6 +346,7 @@ def _filter_history_items(
 def _normalize_history_item(item: dict[str, Any]) -> dict[str, Any]:
     return {
         "id": item.get("id"),
+        "user_key": item.get("user_key"),
         "video_id": item.get("video_id"),
         "title": item.get("title"),
         "subtitle": item.get("subtitle"),
@@ -328,33 +359,48 @@ def _normalize_history_item(item: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _get_total_parse_count() -> int:
+def _get_total_parse_count(user_key: str | None = None) -> int:
+    normalized_user_key = (user_key or "").strip()
     with _get_db_connection() as connection:
-        row = connection.execute(
-            "SELECT total_parse_count FROM parse_stats WHERE id = 1"
-        ).fetchone()
+        if normalized_user_key:
+            row = connection.execute(
+                "SELECT total_parse_count FROM parse_user_stats WHERE user_key = ?",
+                (normalized_user_key,),
+            ).fetchone()
+        else:
+            row = connection.execute(
+                "SELECT total_parse_count FROM parse_stats WHERE id = 1"
+            ).fetchone()
     return int(row["total_parse_count"] if row else 0)
 
 
-def _list_history_items(limit: int | None = None) -> list[dict[str, Any]]:
+def _list_history_items(limit: int | None = None, user_key: str | None = None) -> list[dict[str, Any]]:
     sql = """
-        SELECT id, video_id, title, subtitle, platform, cover_url, video_url, source, created_at, display_date
+        SELECT id, user_key, video_id, title, subtitle, platform, cover_url, video_url, source, created_at, display_date
         FROM parse_history
-        ORDER BY created_at DESC
     """
-    params: tuple[Any, ...] = ()
+    params: list[Any] = []
+    normalized_user_key = (user_key or "").strip()
+    if normalized_user_key:
+        sql += " WHERE user_key = ?"
+        params.append(normalized_user_key)
+    sql += " ORDER BY created_at DESC"
     if limit is not None:
         sql += " LIMIT ?"
-        params = (limit,)
+        params.append(limit)
     with _get_db_connection() as connection:
-        rows = connection.execute(sql, params).fetchall()
+        rows = connection.execute(sql, tuple(params)).fetchall()
     return [_normalize_history_item(dict(row)) for row in rows]
 
 
-def _clear_history_items() -> None:
+def _clear_history_items(user_key: str | None = None) -> None:
+    normalized_user_key = (user_key or "").strip()
     with DATA_LOCK:
         with _get_db_connection() as connection:
-            connection.execute("DELETE FROM parse_history")
+            if normalized_user_key:
+                connection.execute("DELETE FROM parse_history WHERE user_key = ?", (normalized_user_key,))
+            else:
+                connection.execute("DELETE FROM parse_history")
             connection.commit()
 
 
@@ -458,7 +504,7 @@ def _parse_to_mp_result(request: MPParseRequest | MPRefreshRequest) -> dict[str,
         video_info = _pick_video_info(video_infos)
         if video_info is None or not video_info.with_valid_download_url:
             return _legacy_failure("未解析到可用视频信息", _to_mp_video_data(video_info))
-        _append_history_record(video_info)
+        _append_history_record(video_info, user_key=request.user_key)
         return _legacy_success(_to_mp_video_data(video_info), retdesc="解析成功")
     except Exception as exc:
         return _legacy_failure(f"解析失败: {exc}", _null_mp_video_data())
@@ -571,13 +617,13 @@ def mp_refresh_video(request: MPRefreshRequest) -> dict[str, Any]:
 
 
 @app.get("/api/history")
-def mp_history(search: str = "", period: str = "all", limit: int = 100) -> dict[str, Any]:
-    history = _list_history_items()
+def mp_history(search: str = "", period: str = "all", limit: int = 100, user_key: str = "") -> dict[str, Any]:
+    history = _list_history_items(user_key=user_key)
     filtered = _filter_history_items(history, search=search, period=period)
     return _legacy_success(
         {
             "items": filtered[: max(0, limit)],
-            "total_count": _get_total_parse_count(),
+            "total_count": _get_total_parse_count(user_key=user_key),
             "history_count": len(history),
         },
         retdesc="获取历史记录成功",
@@ -585,8 +631,8 @@ def mp_history(search: str = "", period: str = "all", limit: int = 100) -> dict[
 
 
 @app.post("/api/history/clear")
-def mp_clear_history() -> dict[str, Any]:
-    _clear_history_items()
+def mp_clear_history(request: MPHistoryClearRequest) -> dict[str, Any]:
+    _clear_history_items(user_key=request.user_key)
     return _legacy_success({"cleared": True}, retdesc="已清空历史记录")
 
 
@@ -605,11 +651,11 @@ def mp_ranking(search: str = "", period: str = "7", limit: int = 50) -> dict[str
 
 
 @app.get("/api/stats")
-def mp_stats() -> dict[str, Any]:
-    history = _list_history_items()
+def mp_stats(user_key: str = "") -> dict[str, Any]:
+    history = _list_history_items(user_key=user_key)
     return _legacy_success(
         {
-            "total_count": _get_total_parse_count(),
+            "total_count": _get_total_parse_count(user_key=user_key),
             "history_count": len(history),
         },
         retdesc="获取统计信息成功",
