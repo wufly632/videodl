@@ -418,6 +418,52 @@ systemctl restart videodl
 - If the backend can return a valid object URL but the mini app still cannot save the file, re-check the WeChat `downloadFile` legal domains.
 - If some platforms return `m3u8` streams, ensure `ffmpeg` is installed and callable by the service user.
 
+#### 9. Docker Deployment
+
+If Docker is already installed on the server, you can deploy the mini app backend directly with the files in this repository.
+
+1. Prepare the project:
+
+```bash
+cd /opt
+git clone git@github.com:wufly632/videodl.git
+cd videodl
+cp .env.example .env
+```
+
+2. Edit `.env` and fill in the real object storage values.
+
+3. Start the service:
+
+```bash
+docker compose up -d --build
+```
+
+4. Verify:
+
+```bash
+docker compose ps
+docker compose logs -f videodl
+curl http://127.0.0.1:19050/health
+```
+
+The compose file mounts `./data` into the container and stores these runtime files there:
+
+- SQLite database: `./data/videodl_api.db`
+- Legacy JSON migration source: `./data/videodl_api_data.json`
+- Temporary downloaded videos before object storage upload: `./data/tmp/videodl_mp_downloads`
+
+Useful Docker commands:
+
+```bash
+docker compose restart videodl
+docker compose pull
+docker compose up -d --build
+docker compose logs -f videodl
+```
+
+When deploying behind `nginx`, continue to reverse proxy to `127.0.0.1:19050`.
+
 
 # ⚡ Quick Start
 

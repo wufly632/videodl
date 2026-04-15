@@ -1,0 +1,18 @@
+services:
+  videodl:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: videodl-api:latest
+    container_name: videodl-api
+    restart: always
+    ports:
+      - "19050:19050"
+    env_file:
+      - .env
+    environment:
+      VIDEODL_API_DB_FILE: /data/videodl_api.db
+      VIDEODL_API_LEGACY_DATA_FILE: /data/videodl_api_data.json
+      VIDEODL_DOWNLOAD_TMP_DIR: /data/tmp/videodl_mp_downloads
+    volumes:
+      - ./data:/data

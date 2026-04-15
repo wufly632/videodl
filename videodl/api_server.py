@@ -30,11 +30,19 @@ from .modules import VideoInfo, legalizestring
 from .__init__ import __version__
 
 
-DB_FILE = Path(__file__).resolve().parents[1] / "videodl_api.db"
-LEGACY_DATA_FILE = Path(__file__).resolve().parents[1] / "videodl_api_data.json"
+def _path_from_env(env_name: str, default_path: Path) -> Path:
+    value = os.getenv(env_name, "").strip()
+    return Path(value).expanduser() if value else default_path
+
+
+DB_FILE = _path_from_env("VIDEODL_API_DB_FILE", Path(__file__).resolve().parents[1] / "videodl_api.db")
+LEGACY_DATA_FILE = _path_from_env("VIDEODL_API_LEGACY_DATA_FILE", Path(__file__).resolve().parents[1] / "videodl_api_data.json")
 DATA_LOCK = Lock()
 MAX_HISTORY_ITEMS = 500
-DOWNLOAD_TMP_DIR = Path(tempfile.gettempdir()) / "videodl_mp_downloads"
+DOWNLOAD_TMP_DIR = _path_from_env(
+    "VIDEODL_DOWNLOAD_TMP_DIR",
+    Path(tempfile.gettempdir()) / "videodl_mp_downloads",
+)
 
 
 class ClientOptions(BaseModel):
