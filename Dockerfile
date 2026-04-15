@@ -2,7 +2,8 @@ FROM python:3.11-slim
 
 ARG APT_DEBIAN_MIRROR=https://mirrors.aliyun.com/debian
 ARG APT_SECURITY_MIRROR=https://mirrors.aliyun.com/debian-security
-ARG PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
+ARG PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/
+ARG PIP_TRUSTED_HOST=mirrors.aliyun.com
 ARG PIP_DEFAULT_TIMEOUT=120
 ARG PIP_RETRIES=10
 
@@ -30,11 +31,13 @@ COPY videodl /app/videodl
 
 RUN python -m pip install \
         --index-url "${PIP_INDEX_URL}" \
+        --trusted-host "${PIP_TRUSTED_HOST}" \
         --default-timeout "${PIP_DEFAULT_TIMEOUT}" \
         --retries "${PIP_RETRIES}" \
         -r requirements.txt \
     && python -m pip install \
         --index-url "${PIP_INDEX_URL}" \
+        --trusted-host "${PIP_TRUSTED_HOST}" \
         --default-timeout "${PIP_DEFAULT_TIMEOUT}" \
         --retries "${PIP_RETRIES}" \
         -e .
